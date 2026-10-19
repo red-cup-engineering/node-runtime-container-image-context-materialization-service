@@ -23,5 +23,9 @@
   },
   "engines": {
     "node": ">=24"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/red-cup-engineering/node-runtime-container-image-context-materialization-service.git"
   }
 }
