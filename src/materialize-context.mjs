@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { constants as FS_CONSTANTS } from "node:fs";
 import { lstat, mkdir, open, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { sha256Digest, sha256Hex } from "@red-cup-engineering/cryptographic-computer-data-engineering-services-section/integrity";
 
 export const RECEIPT_FILE = "node-runtime-container-image-context-receipt.json";
@@ -196,10 +196,44 @@ async function readCatalog(catalogDirectory, supplied) {
   return admitted;
 }
 
+/** Prevent one untrusted output coordinate from writing into an original
+ * source catalog or immutable runtime release, even through a symlinked
+ * ancestor. The caller still owns the parent directory; concurrent hostile
+ * parent replacement requires OS-level dirfd confinement, not a path check.
+ */
+function nestedWithin(root, destination) {
+  const delta = relative(root, destination);
+  return delta === "" || (delta !== ".." && !delta.startsWith(`..${sep}`) && !isAbsolute(delta));
+}
+function refuseProtectedOutput(destination, roots) {
+  if (roots.some(root => nestedWithin(root, destination)))
+    throw new TypeError("outputDirectory aliases protected runtime catalog or release territory");
+}
+async function projectedOutputDestination(requested, protectedRoots) {
+  // Resolve the nearest EXISTING ancestor before mkdir: an alias hidden in
+  // an old parent symlink must not create even empty directories in a release.
+  let ancestor = dirname(requested);
+  const missing = [];
+  for (;;) {
+    try {
+      const actualAncestor = await realpath(ancestor);
+      const projected = join(actualAncestor, ...missing, basename(requested));
+      refuseProtectedOutput(projected, protectedRoots);
+      return projected;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      const parent = dirname(ancestor);
+      if (parent === ancestor) throw error;
+      missing.unshift(basename(ancestor));
+      ancestor = parent;
+    }
+  }
+}
+
 export async function materializeNodeRuntimeContainerImageContext(input, { runtimeReleaseAuthority } = {}) {
   const authority = requireAuthority(runtimeReleaseAuthority);
   const catalogDirectory = await realpath(input?.catalogDirectory ?? "");
-  const output = resolve(String(input?.outputDirectory ?? ""));
+  let output = resolve(String(input?.outputDirectory ?? ""));
   if (output === "/") throw new TypeError("outputDirectory must be one non-root path");
   const outputFromCatalog = relative(catalogDirectory, output);
   if (outputFromCatalog === "" || (!outputFromCatalog.startsWith(`..${sep}`) && outputFromCatalog !== "..")) throw new TypeError("outputDirectory must be outside the runtime catalog territory");
@@ -211,7 +245,19 @@ export async function materializeNodeRuntimeContainerImageContext(input, { runti
   const policy = normalizePolicy(input?.layoutPolicy, catalog);
   const staticFiles = await normalizeStaticCarriers(input?.staticCarriers ?? []);
   assertNoDestinationOverlap(policy, staticFiles);
+  // A lexical relative(catalog, output) check cannot see an ancestor symlink
+  // into the catalog or an immutable sibling release. Source ownership is
+  // protected BEFORE the first output-parent directory is created.
+  const protectedRoots = [catalogDirectory, ...await Promise.all(
+    catalog.entries.map(entry => realpath(resolve(catalogDirectory, entry.releaseRelativePath)))
+  )];
+  const projectedOutput = await projectedOutputDestination(output, protectedRoots);
   await mkdir(dirname(output), { recursive: true });
+  const anchoredOutput = join(await realpath(dirname(output)), basename(output));
+  refuseProtectedOutput(anchoredOutput, protectedRoots);
+  if (anchoredOutput !== projectedOutput)
+    throw new TypeError("outputDirectory parent identity changed during admission");
+  output = anchoredOutput;
   try { await mkdir(output, { recursive: false }); }
   catch (error) { if (error?.code === "EEXIST") throw new TypeError("outputDirectory must not already exist"); throw error; }
   try {
@@ -281,8 +327,14 @@ function admitReceipt(value) {
 
 export async function verifyNodeRuntimeContainerImageContext({ contextDirectory, receipt } = {}) {
   const root = await realpath(contextDirectory ?? "");
-  const supplied = admitReceipt(receipt ?? JSON.parse(await readFile(join(root, RECEIPT_FILE), "utf8")));
+  // Receipt custody belongs to the materialized context itself. An outside
+  // caller's valid original receipt cannot override a replaced/missing local
+  // manifest; accept both only when they describe the exact same document.
+  const recorded = admitReceipt(JSON.parse(await readFile(join(root, RECEIPT_FILE), "utf8")));
+  const supplied = receipt === undefined ? recorded : admitReceipt(receipt);
   const defects = [];
+  if (json(recorded) !== json(supplied))
+    defects.push("stored-context-receipt-differs");
   let measured;
   try { measured = await measuredFiles(root, { omitReceipt: true }); }
   catch (error) {
