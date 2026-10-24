@@ -107,7 +107,9 @@ function admitCatalogReceipt(value) {
   const entries = [...value.entries].sort((a, b) => String(a.id).localeCompare(String(b.id)));
   if (new Set(entries.map(({ id }) => id)).size !== entries.length) throw new TypeError("catalog entry identities must be unique");
   for (const entry of entries) {
-    if (!SAFE_ID.test(entry?.id ?? "") || !SHA256.test(entry?.artifactDigest ?? "") || entry.releaseRelativePath !== `../../releases/${entry.artifactDigest}`) throw new TypeError(`catalog entry ${entry?.id ?? "<unknown>"} is malformed or not digest-bound`);
+    if (!SAFE_ID.test(entry?.id ?? "") || !SHA256.test(entry?.artifactDigest ?? "") ||
+      (entry.fileTreeDigest !== undefined && !/^sha256:[a-f0-9]{64}$/u.test(entry.fileTreeDigest)) ||
+      entry.releaseRelativePath !== `../../releases/${entry.artifactDigest}`) throw new TypeError(`catalog entry ${entry?.id ?? "<unknown>"} is malformed or not digest-bound`);
   }
   const body = { type: value.type, version: value.version, entries: value.entries };
   if (sha256Hex(json(body)) !== value.digest) throw new TypeError("catalog receipt digest is invalid");
@@ -266,12 +268,22 @@ export async function materializeNodeRuntimeContainerImageContext(input, { runti
       const entry = catalogIndex.get(declaration.id), releaseDirectory = resolve(catalogDirectory, entry.releaseRelativePath);
       const releaseObservation = await authority.verifyNodeRuntimeRelease(releaseDirectory);
       if (!releaseObservation.ok || releaseObservation.expectedDigest !== entry.artifactDigest || releaseObservation.observedDigest !== entry.artifactDigest) throw new TypeError(`runtime release ${entry.id} no longer agrees with its catalog artifact digest`);
+      // The catalog's new strongly framed per-file commitment cannot be
+      // downgraded to an old digest-only verifier by losing a receipt field.
+      if (entry.fileTreeDigest !== undefined &&
+          (releaseObservation.fileTreeVerified !== true ||
+           releaseObservation.fileTreeDigest !== entry.fileTreeDigest))
+        throw new TypeError(`runtime release ${entry.id} has no catalog-matched framed file-tree identity`);
       const sourceFiles = await measuredFiles(join(releaseDirectory, "app"), { prefix: declaration.mount });
       for (const file of sourceFiles) await writeBytesExact(file.content, join(output, ...file.path.split("/")), file.mode);
       const copied = await measuredFiles(join(output, ...declaration.mount.split("/")), { prefix: declaration.mount });
       const observed = artifactDigest(copied, declaration.mount);
       if (observed.digest !== entry.artifactDigest) throw new TypeError(`copied runtime release ${entry.id} differs from catalog artifact ${entry.artifactDigest}`);
-      mountedEntries.push(Object.freeze({ id: entry.id, entryPackage: entry.entryPackage ?? null, entryVersion: entry.entryVersion ?? null, artifactDigest: entry.artifactDigest, mount: declaration.mount, fileCount: observed.fileCount, byteCount: observed.byteCount }));
+      mountedEntries.push(Object.freeze({ id: entry.id, entryPackage: entry.entryPackage ?? null,
+        entryVersion: entry.entryVersion ?? null, artifactDigest: entry.artifactDigest,
+        fileTreeDigest: entry.fileTreeDigest ?? null,
+        fileTreeIdentityAssurance: entry.fileTreeDigest === undefined ? "legacy-unframed" : "domain-separated-file-tree",
+        mount: declaration.mount, fileCount: observed.fileCount, byteCount: observed.byteCount }));
     }
     for (const file of staticFiles) await writeBytesExact(file.content, join(output, ...file.path.split("/")), file.mode);
     const finalMeasured = await measuredFiles(output, { omitReceipt: true });
@@ -304,7 +316,13 @@ function admitReceipt(value) {
   const entryIds = new Set(), mounts = [];
   for (const entry of value.entries) {
     const mount = exactRelativePath(entry?.mount, `receipt mount for ${entry?.id ?? "<unknown>"}`);
-    if (!SAFE_ID.test(entry?.id ?? "") || entryIds.has(entry.id) || !SHA256.test(entry.artifactDigest ?? "") || !Number.isSafeInteger(entry.fileCount) || entry.fileCount < 1 || !Number.isSafeInteger(entry.byteCount) || entry.byteCount < 0) throw new TypeError("context receipt runtime entry is malformed");
+    if (!SAFE_ID.test(entry?.id ?? "") || entryIds.has(entry.id) || !SHA256.test(entry.artifactDigest ?? "") ||
+        (entry.fileTreeDigest !== null && entry.fileTreeDigest !== undefined &&
+         !/^sha256:[a-f0-9]{64}$/u.test(entry.fileTreeDigest)) ||
+        (entry.fileTreeDigest == null && entry.fileTreeIdentityAssurance === "domain-separated-file-tree") ||
+        !Number.isSafeInteger(entry.fileCount) || entry.fileCount < 1 ||
+        !Number.isSafeInteger(entry.byteCount) || entry.byteCount < 0)
+      throw new TypeError("context receipt runtime entry is malformed");
     entryIds.add(entry.id); mounts.push(mount);
   }
   for (let left = 0; left < mounts.length; left += 1) for (let right = left + 1; right < mounts.length; right += 1) if (overlaps(mounts[left], mounts[right])) throw new TypeError("context receipt runtime mounts overlap");
