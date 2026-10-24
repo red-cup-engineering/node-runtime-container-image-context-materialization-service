@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import { constants as FS_CONSTANTS } from "node:fs";
 import { lstat, mkdir, open, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { sha256Digest, sha256Hex } from "@red-cup-engineering/cryptographic-computer-data-engineering-services-section/integrity";
+import { projectedOutputDestination, refuseProtectedOutput } from "./protected-output.mjs";
 
 export const RECEIPT_FILE = "node-runtime-container-image-context-receipt.json";
 const SHA256 = /^[a-f0-9]{64}$/u;
@@ -203,35 +204,6 @@ async function readCatalog(catalogDirectory, supplied) {
  * ancestor. The caller still owns the parent directory; concurrent hostile
  * parent replacement requires OS-level dirfd confinement, not a path check.
  */
-function nestedWithin(root, destination) {
-  const delta = relative(root, destination);
-  return delta === "" || (delta !== ".." && !delta.startsWith(`..${sep}`) && !isAbsolute(delta));
-}
-function refuseProtectedOutput(destination, roots) {
-  if (roots.some(root => nestedWithin(root, destination)))
-    throw new TypeError("outputDirectory aliases protected runtime catalog or release territory");
-}
-async function projectedOutputDestination(requested, protectedRoots) {
-  // Resolve the nearest EXISTING ancestor before mkdir: an alias hidden in
-  // an old parent symlink must not create even empty directories in a release.
-  let ancestor = dirname(requested);
-  const missing = [];
-  for (;;) {
-    try {
-      const actualAncestor = await realpath(ancestor);
-      const projected = join(actualAncestor, ...missing, basename(requested));
-      refuseProtectedOutput(projected, protectedRoots);
-      return projected;
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-      const parent = dirname(ancestor);
-      if (parent === ancestor) throw error;
-      missing.unshift(basename(ancestor));
-      ancestor = parent;
-    }
-  }
-}
-
 export async function materializeNodeRuntimeContainerImageContext(input, { runtimeReleaseAuthority } = {}) {
   const authority = requireAuthority(runtimeReleaseAuthority);
   const catalogDirectory = await realpath(input?.catalogDirectory ?? "");
