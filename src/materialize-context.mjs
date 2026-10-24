@@ -3,6 +3,7 @@ import { constants as FS_CONSTANTS } from "node:fs";
 import { lstat, mkdir, open, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { sha256Digest, sha256Hex } from "@red-cup-engineering/cryptographic-computer-data-engineering-services-section/integrity";
+import { projectedOutputDestination, refuseProtectedOutput } from "./protected-output.mjs";
 
 export const RECEIPT_FILE = "node-runtime-container-image-context-receipt.json";
 const SHA256 = /^[a-f0-9]{64}$/u;
@@ -107,7 +108,9 @@ function admitCatalogReceipt(value) {
   const entries = [...value.entries].sort((a, b) => String(a.id).localeCompare(String(b.id)));
   if (new Set(entries.map(({ id }) => id)).size !== entries.length) throw new TypeError("catalog entry identities must be unique");
   for (const entry of entries) {
-    if (!SAFE_ID.test(entry?.id ?? "") || !SHA256.test(entry?.artifactDigest ?? "") || entry.releaseRelativePath !== `../../releases/${entry.artifactDigest}`) throw new TypeError(`catalog entry ${entry?.id ?? "<unknown>"} is malformed or not digest-bound`);
+    if (!SAFE_ID.test(entry?.id ?? "") || !SHA256.test(entry?.artifactDigest ?? "") ||
+      (entry.fileTreeDigest !== undefined && !/^sha256:[a-f0-9]{64}$/u.test(entry.fileTreeDigest)) ||
+      entry.releaseRelativePath !== `../../releases/${entry.artifactDigest}`) throw new TypeError(`catalog entry ${entry?.id ?? "<unknown>"} is malformed or not digest-bound`);
   }
   const body = { type: value.type, version: value.version, entries: value.entries };
   if (sha256Hex(json(body)) !== value.digest) throw new TypeError("catalog receipt digest is invalid");
@@ -196,10 +199,15 @@ async function readCatalog(catalogDirectory, supplied) {
   return admitted;
 }
 
+/** Prevent one untrusted output coordinate from writing into an original
+ * source catalog or immutable runtime release, even through a symlinked
+ * ancestor. The caller still owns the parent directory; concurrent hostile
+ * parent replacement requires OS-level dirfd confinement, not a path check.
+ */
 export async function materializeNodeRuntimeContainerImageContext(input, { runtimeReleaseAuthority } = {}) {
   const authority = requireAuthority(runtimeReleaseAuthority);
   const catalogDirectory = await realpath(input?.catalogDirectory ?? "");
-  const output = resolve(String(input?.outputDirectory ?? ""));
+  let output = resolve(String(input?.outputDirectory ?? ""));
   if (output === "/") throw new TypeError("outputDirectory must be one non-root path");
   const outputFromCatalog = relative(catalogDirectory, output);
   if (outputFromCatalog === "" || (!outputFromCatalog.startsWith(`..${sep}`) && outputFromCatalog !== "..")) throw new TypeError("outputDirectory must be outside the runtime catalog territory");
@@ -211,7 +219,19 @@ export async function materializeNodeRuntimeContainerImageContext(input, { runti
   const policy = normalizePolicy(input?.layoutPolicy, catalog);
   const staticFiles = await normalizeStaticCarriers(input?.staticCarriers ?? []);
   assertNoDestinationOverlap(policy, staticFiles);
+  // A lexical relative(catalog, output) check cannot see an ancestor symlink
+  // into the catalog or an immutable sibling release. Source ownership is
+  // protected BEFORE the first output-parent directory is created.
+  const protectedRoots = [catalogDirectory, ...await Promise.all(
+    catalog.entries.map(entry => realpath(resolve(catalogDirectory, entry.releaseRelativePath)))
+  )];
+  const projectedOutput = await projectedOutputDestination(output, protectedRoots);
   await mkdir(dirname(output), { recursive: true });
+  const anchoredOutput = join(await realpath(dirname(output)), basename(output));
+  refuseProtectedOutput(anchoredOutput, protectedRoots);
+  if (anchoredOutput !== projectedOutput)
+    throw new TypeError("outputDirectory parent identity changed during admission");
+  output = anchoredOutput;
   try { await mkdir(output, { recursive: false }); }
   catch (error) { if (error?.code === "EEXIST") throw new TypeError("outputDirectory must not already exist"); throw error; }
   try {
@@ -220,12 +240,22 @@ export async function materializeNodeRuntimeContainerImageContext(input, { runti
       const entry = catalogIndex.get(declaration.id), releaseDirectory = resolve(catalogDirectory, entry.releaseRelativePath);
       const releaseObservation = await authority.verifyNodeRuntimeRelease(releaseDirectory);
       if (!releaseObservation.ok || releaseObservation.expectedDigest !== entry.artifactDigest || releaseObservation.observedDigest !== entry.artifactDigest) throw new TypeError(`runtime release ${entry.id} no longer agrees with its catalog artifact digest`);
+      // The catalog's new strongly framed per-file commitment cannot be
+      // downgraded to an old digest-only verifier by losing a receipt field.
+      if (entry.fileTreeDigest !== undefined &&
+          (releaseObservation.fileTreeVerified !== true ||
+           releaseObservation.fileTreeDigest !== entry.fileTreeDigest))
+        throw new TypeError(`runtime release ${entry.id} has no catalog-matched framed file-tree identity`);
       const sourceFiles = await measuredFiles(join(releaseDirectory, "app"), { prefix: declaration.mount });
       for (const file of sourceFiles) await writeBytesExact(file.content, join(output, ...file.path.split("/")), file.mode);
       const copied = await measuredFiles(join(output, ...declaration.mount.split("/")), { prefix: declaration.mount });
       const observed = artifactDigest(copied, declaration.mount);
       if (observed.digest !== entry.artifactDigest) throw new TypeError(`copied runtime release ${entry.id} differs from catalog artifact ${entry.artifactDigest}`);
-      mountedEntries.push(Object.freeze({ id: entry.id, entryPackage: entry.entryPackage ?? null, entryVersion: entry.entryVersion ?? null, artifactDigest: entry.artifactDigest, mount: declaration.mount, fileCount: observed.fileCount, byteCount: observed.byteCount }));
+      mountedEntries.push(Object.freeze({ id: entry.id, entryPackage: entry.entryPackage ?? null,
+        entryVersion: entry.entryVersion ?? null, artifactDigest: entry.artifactDigest,
+        fileTreeDigest: entry.fileTreeDigest ?? null,
+        fileTreeIdentityAssurance: entry.fileTreeDigest === undefined ? "legacy-unframed" : "domain-separated-file-tree",
+        mount: declaration.mount, fileCount: observed.fileCount, byteCount: observed.byteCount }));
     }
     for (const file of staticFiles) await writeBytesExact(file.content, join(output, ...file.path.split("/")), file.mode);
     const finalMeasured = await measuredFiles(output, { omitReceipt: true });
@@ -258,7 +288,13 @@ function admitReceipt(value) {
   const entryIds = new Set(), mounts = [];
   for (const entry of value.entries) {
     const mount = exactRelativePath(entry?.mount, `receipt mount for ${entry?.id ?? "<unknown>"}`);
-    if (!SAFE_ID.test(entry?.id ?? "") || entryIds.has(entry.id) || !SHA256.test(entry.artifactDigest ?? "") || !Number.isSafeInteger(entry.fileCount) || entry.fileCount < 1 || !Number.isSafeInteger(entry.byteCount) || entry.byteCount < 0) throw new TypeError("context receipt runtime entry is malformed");
+    if (!SAFE_ID.test(entry?.id ?? "") || entryIds.has(entry.id) || !SHA256.test(entry.artifactDigest ?? "") ||
+        (entry.fileTreeDigest !== null && entry.fileTreeDigest !== undefined &&
+         !/^sha256:[a-f0-9]{64}$/u.test(entry.fileTreeDigest)) ||
+        (entry.fileTreeDigest == null && entry.fileTreeIdentityAssurance === "domain-separated-file-tree") ||
+        !Number.isSafeInteger(entry.fileCount) || entry.fileCount < 1 ||
+        !Number.isSafeInteger(entry.byteCount) || entry.byteCount < 0)
+      throw new TypeError("context receipt runtime entry is malformed");
     entryIds.add(entry.id); mounts.push(mount);
   }
   for (let left = 0; left < mounts.length; left += 1) for (let right = left + 1; right < mounts.length; right += 1) if (overlaps(mounts[left], mounts[right])) throw new TypeError("context receipt runtime mounts overlap");
@@ -281,8 +317,14 @@ function admitReceipt(value) {
 
 export async function verifyNodeRuntimeContainerImageContext({ contextDirectory, receipt } = {}) {
   const root = await realpath(contextDirectory ?? "");
-  const supplied = admitReceipt(receipt ?? JSON.parse(await readFile(join(root, RECEIPT_FILE), "utf8")));
+  // Receipt custody belongs to the materialized context itself. An outside
+  // caller's valid original receipt cannot override a replaced/missing local
+  // manifest; accept both only when they describe the exact same document.
+  const recorded = admitReceipt(JSON.parse(await readFile(join(root, RECEIPT_FILE), "utf8")));
+  const supplied = receipt === undefined ? recorded : admitReceipt(receipt);
   const defects = [];
+  if (json(recorded) !== json(supplied))
+    defects.push("stored-context-receipt-differs");
   let measured;
   try { measured = await measuredFiles(root, { omitReceipt: true }); }
   catch (error) {
