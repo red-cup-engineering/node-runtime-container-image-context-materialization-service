@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -230,6 +231,33 @@ test("stored image-context receipt must agree with supplied evidence and must ex
       verifyNodeRuntimeContainerImageContext({ contextDirectory: output, receipt }),
       { code: "ENOENT" },
     );
+  } finally { await rm(value.root, { recursive: true, force: true }); }
+});
+
+test("framed catalog claims cannot be downgraded by an older runtime verifier", async () => {
+  const value = await fixture(["worker"]);
+  try {
+    const catalog = structuredClone(value.runtimeReleaseCatalogReceipt);
+    catalog.entries[0].fileTreeDigest = "sha256:" + "a".repeat(64);
+    // Recompute the ORIGINAL catalog-record digest, so the rejection is due
+    // to missing independent release FILE-TREE proof, not malformed metadata.
+    const body = { type: catalog.type, version: catalog.version, entries: catalog.entries };
+    catalog.digest = createHash("sha256").update(JSON.stringify(body)).digest("hex");
+    await writeFile(join(value.catalog.catalogDirectory, "runtime-release-catalog.json"),
+      JSON.stringify(catalog));
+    const verificationObservation = await verifyNodeRuntimeReleaseCatalog(
+      value.catalog.catalogDirectory);
+    assert.equal(verificationObservation.ok, true,
+      "the older producer's catalog readout can still report OK without tree proof");
+    const output = join(value.root, "unsupported-strong-context");
+    await assert.rejects(materializeNodeRuntimeContainerImageContext({
+      catalogDirectory: value.catalog.catalogDirectory,
+      runtimeReleaseCatalogReceipt: catalog,
+      verificationObservation,
+      layoutPolicy: policy([{ id: "worker", mount: "app" }]),
+      outputDirectory: output,
+    }, { runtimeReleaseAuthority }), /no catalog-matched framed file-tree identity/u);
+    await assert.rejects(lstat(output), { code: "ENOENT" });
   } finally { await rm(value.root, { recursive: true, force: true }); }
 });
 
