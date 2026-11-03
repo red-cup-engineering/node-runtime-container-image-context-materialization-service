@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import {
@@ -160,6 +161,103 @@ test("traversal, symbolic links, credential names, and secret bytes are refused"
     await assert.rejects(materializeNodeRuntimeContainerImageContext({ ...base, staticCarriers: [{ path: "large.bin", utf8: largeSecret }], outputDirectory: join(value.root, "five") }, { runtimeReleaseAuthority }), /secret material/u);
     const nulSecret = Buffer.from("ordinary\0\n_authToken=not-a-real-token\n", "utf8").toString("base64");
     await assert.rejects(materializeNodeRuntimeContainerImageContext({ ...base, staticCarriers: [{ path: "nul.bin", base64: nulSecret }], outputDirectory: join(value.root, "six") }, { runtimeReleaseAuthority }), /secret material/u);
+  } finally { await rm(value.root, { recursive: true, force: true }); }
+});
+
+test("symlinked output parents cannot write into immutable catalogs or releases", async () => {
+  const value = await fixture(["worker"]);
+  try {
+    const base = {
+      catalogDirectory: value.catalog.catalogDirectory,
+      runtimeReleaseCatalogReceipt: value.runtimeReleaseCatalogReceipt,
+      verificationObservation: value.verificationObservation,
+      layoutPolicy: policy([{ id: "worker", mount: "app" }]),
+    };
+    const catalogAlias = join(value.root, "catalog-alias");
+    await symlink(value.catalog.catalogDirectory, catalogAlias);
+    await assert.rejects(materializeNodeRuntimeContainerImageContext({
+      ...base, outputDirectory: join(catalogAlias, "unwanted-context"),
+    }, { runtimeReleaseAuthority }), /aliases protected runtime catalog or release territory/u);
+    await assert.rejects(lstat(join(value.catalog.catalogDirectory, "unwanted-context")), { code: "ENOENT" });
+
+    const release = value.catalog.entries[0];
+    const releaseDirectory = join(value.catalog.catalogDirectory, release.releaseRelativePath);
+    const releaseAlias = join(value.root, "release-alias");
+    await symlink(releaseDirectory, releaseAlias);
+    // Check the nearest existing ancestor BEFORE creating missing parents.
+    await assert.rejects(materializeNodeRuntimeContainerImageContext({
+      ...base, outputDirectory: join(releaseAlias, "fresh-parent", "unwanted-context"),
+    }, { runtimeReleaseAuthority }), /aliases protected runtime catalog or release territory/u);
+    await assert.rejects(lstat(join(releaseDirectory, "fresh-parent")), { code: "ENOENT" });
+
+    // A harmless output alias still works; only protected source territory
+    // is forbidden. No accidental broad ban on symbolic-link parent paths.
+    const outputParent = join(value.root, "safe-build-output");
+    await mkdir(outputParent);
+    const safeAlias = join(value.root, "safe-alias");
+    await symlink(outputParent, safeAlias);
+    const accepted = await materializeNodeRuntimeContainerImageContext({
+      ...base, outputDirectory: join(safeAlias, "context"),
+    }, { runtimeReleaseAuthority });
+    assert.equal((await verifyNodeRuntimeContainerImageContext({
+      contextDirectory: join(outputParent, "context"), receipt: accepted,
+    })).ok, true);
+  } finally { await rm(value.root, { recursive: true, force: true }); }
+});
+
+test("stored image-context receipt must agree with supplied evidence and must exist", async () => {
+  const value = await fixture(["worker"]);
+  try {
+    const output = join(value.root, "context");
+    const receipt = await materializeNodeRuntimeContainerImageContext({
+      catalogDirectory: value.catalog.catalogDirectory,
+      verificationObservation: value.verificationObservation,
+      layoutPolicy: policy([{ id: "worker", mount: "app" }]),
+      outputDirectory: output,
+    }, { runtimeReleaseAuthority });
+    const manifest = join(output, RECEIPT_FILE);
+    assert.equal((await verifyNodeRuntimeContainerImageContext({ contextDirectory: output, receipt })).ok, true);
+
+    // Previously an entirely valid caller-supplied receipt bypassed the
+    // on-disk manifest, even if it was augmented after signing.
+    await writeFile(manifest, JSON.stringify({ ...receipt, unauthorizedSideAssertion: "paid" }));
+    const negative = await verifyNodeRuntimeContainerImageContext({
+      contextDirectory: output, receipt,
+    });
+    assert.equal(negative.ok, false);
+    assert.ok(negative.defects.includes("stored-context-receipt-differs"));
+    await rm(manifest);
+    await assert.rejects(
+      verifyNodeRuntimeContainerImageContext({ contextDirectory: output, receipt }),
+      { code: "ENOENT" },
+    );
+  } finally { await rm(value.root, { recursive: true, force: true }); }
+});
+
+test("framed catalog claims cannot be downgraded by an older runtime verifier", async () => {
+  const value = await fixture(["worker"]);
+  try {
+    const catalog = structuredClone(value.runtimeReleaseCatalogReceipt);
+    catalog.entries[0].fileTreeDigest = "sha256:" + "a".repeat(64);
+    // Recompute the ORIGINAL catalog-record digest, so the rejection is due
+    // to missing independent release FILE-TREE proof, not malformed metadata.
+    const body = { type: catalog.type, version: catalog.version, entries: catalog.entries };
+    catalog.digest = createHash("sha256").update(JSON.stringify(body)).digest("hex");
+    await writeFile(join(value.catalog.catalogDirectory, "runtime-release-catalog.json"),
+      JSON.stringify(catalog));
+    const verificationObservation = await verifyNodeRuntimeReleaseCatalog(
+      value.catalog.catalogDirectory);
+    assert.equal(verificationObservation.ok, true,
+      "the older producer's catalog readout can still report OK without tree proof");
+    const output = join(value.root, "unsupported-strong-context");
+    await assert.rejects(materializeNodeRuntimeContainerImageContext({
+      catalogDirectory: value.catalog.catalogDirectory,
+      runtimeReleaseCatalogReceipt: catalog,
+      verificationObservation,
+      layoutPolicy: policy([{ id: "worker", mount: "app" }]),
+      outputDirectory: output,
+    }, { runtimeReleaseAuthority }), /no catalog-matched framed file-tree identity/u);
+    await assert.rejects(lstat(output), { code: "ENOENT" });
   } finally { await rm(value.root, { recursive: true, force: true }); }
 });
 
